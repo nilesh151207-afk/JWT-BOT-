@@ -3,3 +3,4 @@ pycryptodome
 requests
 protobuf
 PyJWT
+python-telegram-bot>=21,<23

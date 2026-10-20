@@ -4,18 +4,6 @@ import json
 import hmac
 import requests
 from flask import Flask, request, abort, jsonify
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
 
 app = Flask(__name__)
 
@@ -23,152 +11,174 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 OWNER_ID = os.environ.get("TELEGRAM_OWNER_ID", "")
 
-application = Application.builder().token(BOT_TOKEN).build()
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+MAX_FILE_SIZE = 1_000_000
 
-MENU = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("Process File 📤"),
-         KeyboardButton("Vip Status 🛏")],
-        [KeyboardButton("Vip Shop 🛒"),
-         KeyboardButton("GitHub Status 📊")],
-        [KeyboardButton("Scheduled Files ⚙️"),
-         KeyboardButton("Help 🆘")],
-        [KeyboardButton("API 1 🔌"),
-         KeyboardButton("API 2 🔌")],
-        [KeyboardButton("API 3 🔌"),
-         KeyboardButton("API 4 🔌")],
-        [KeyboardButton("API 5 🔌"),
-         KeyboardButton("Cancel ❌")],
+MENU = {
+    "keyboard": [
+        [{"text": "Process File 📤"}, {"text": "Vip Status 🛏"}],
+        [{"text": "Vip Shop 🛒"}, {"text": "GitHub Status 📊"}],
+        [{"text": "Scheduled Files ⚙️"}, {"text": "Help 🆘"}],
+        [{"text": "API 1 🔌"}, {"text": "API 2 🔌"}],
+        [{"text": "API 3 🔌"}, {"text": "API 4 🔌"}],
+        [{"text": "API 5 🔌"}, {"text": "Cancel ❌"}],
     ],
-    resize_keyboard=True,
-)
+    "resize_keyboard": True,
+}
+
+def send_message(chat_id, text, keyboard=True):
+    payload = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        payload["reply_markup"] = MENU
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json=payload,
+            timeout=15,
+        ).raise_for_status()
+    except requests.RequestException:
+        app.logger.exception("Failed to send Telegram message")
 
 @app.get("/")
 def home():
     return "SILENT GMR JWT BOT is running!"
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != OWNER_ID:
-        return
-    await update.message.reply_text(
-        "Welcome to SILENT GMR JWT BOT!\nChoose an option below.",
-        reply_markup=MENU,
+def validate_json_file(document):
+    if not document.get("file_name", "").lower().endswith(".json"):
+        return "Please send a .json file."
+
+    size = document.get("file_size", 0)
+    if size and size > MAX_FILE_SIZE:
+        return "File too large. Maximum size is 1 MB."
+
+    info = requests.get(
+        f"{TELEGRAM_API}/getFile",
+        params={"file_id": document["file_id"]},
+        timeout=15,
+    ).json()
+
+    if not info.get("ok"):
+        return "Could not download the file. Please try again."
+
+    file_path = info["result"]["file_path"]
+    download_url = (
+        f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     )
+    response = requests.get(download_url, timeout=20)
+    response.raise_for_status()
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != OWNER_ID:
-        return
+    if len(response.content) > MAX_FILE_SIZE:
+        return "File too large. Maximum size is 1 MB."
 
-    text = update.message.text
+    data = json.loads(response.content.decode("utf-8"))
 
-    if text == "Process File 📤":
-        context.user_data["waiting_json"] = True
-        await update.message.reply_text(
-            'Ab .json file bhejo. Expected format:\n\n'
-            '[{"uid":"user1","password":"pass1"}]\n\n'
-            "File sirf structure validation ke liye process hogi."
-        )
-    elif text == "Cancel ❌":
-        context.user_data.pop("waiting_json", None)
-        await update.message.reply_text("Operation cancelled.", reply_markup=MENU)
-    elif text == "Vip Status 🛏":
-        await update.message.reply_text("VIP status: Demo mode.")
-    elif text == "Vip Shop 🛒":
-        await update.message.reply_text("VIP shop: Demo mode.")
-    elif text == "GitHub Status 📊":
-        await update.message.reply_text("GitHub status: Not configured.")
-    elif text == "Scheduled Files ⚙️":
-        await update.message.reply_text("No scheduled files configured.")
-    elif text == "Help 🆘":
-        await update.message.reply_text(
-            "Use Process File 📤 to validate a JSON file."
-        )
-    elif text.startswith("API "):
-        await update.message.reply_text(
-            "API integration is not configured yet."
-        )
+    if not isinstance(data, list):
+        return "Invalid format: the JSON top level must be a list."
 
-async def json_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != OWNER_ID:
-        return
-    if not context.user_data.get("waiting_json"):
-        return
+    valid = 0
+    invalid = 0
 
-    document = update.message.document
-    if not document or not document.file_name.lower().endswith(".json"):
-        await update.message.reply_text("Please send a .json document.")
-        return
+    for item in data:
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("uid"), str)
+            and bool(item["uid"].strip())
+            and isinstance(item.get("password"), str)
+            and bool(item["password"])
+        ):
+            valid += 1
+        else:
+            invalid += 1
 
-    if document.file_size and document.file_size > 1_000_000:
-        await update.message.reply_text("File too large. Maximum size: 1 MB.")
-        return
-
-    tg_file = await context.bot.get_file(document.file_id)
-    raw = await tg_file.download_as_bytearray()
-
-    try:
-        data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, list):
-            raise ValueError("Top level must be a JSON list.")
-        valid = 0
-        invalid = 0
-        for item in data:
-            if (
-                isinstance(item, dict)
-                and isinstance(item.get("uid"), str)
-                and item["uid"].strip()
-                and isinstance(item.get("password"), str)
-                and item["password"]
-            ):
-                valid += 1
-            else:
-                invalid += 1
-
-        context.user_data.pop("waiting_json", None)
-        await update.message.reply_text(
-            "JSON validation complete ✅\n"
-            f"Total entries: {len(data)}\n"
-            f"Valid structure: {valid}\n"
-            f"Invalid structure: {invalid}\n"
-            "Passwords were not used or saved.",
-            reply_markup=MENU,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        await update.message.reply_text(
-            "Invalid JSON. Please send a JSON list of objects."
-        )
-
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", start))
-application.add_handler(
-    MessageHandler(filters.Document.ALL, json_handler)
-)
-application.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler)
-)
+    return (
+        "JSON validation complete ✅\n"
+        f"Total entries: {len(data)}\n"
+        f"Valid structure: {valid}\n"
+        f"Invalid structure: {invalid}\n\n"
+        "Passwords were not used or saved."
+    )
 
 @app.post("/webhook")
 def webhook():
-    if not WEBHOOK_SECRET:
+    if not BOT_TOKEN or not WEBHOOK_SECRET:
         abort(500)
+
     supplied = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token", ""
     )
     if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
         abort(403)
 
-    payload = request.get_json(silent=True) or {}
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or {}
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+
+    chat_id = chat.get("id")
+    user_id = str(user.get("id", ""))
+
+    if not chat_id:
+        return jsonify({"ok": True})
+
+    # Owner-only bot
+    if not OWNER_ID or user_id != OWNER_ID:
+        return jsonify({"ok": True})
+
     try:
-        import asyncio
-        asyncio.run(application.initialize())
-        asyncio.run(application.process_update(Update.de_json(payload, application.bot)))
-    except Exception:
-        app.logger.exception("Update processing failed")
-        return jsonify({"ok": False}), 500
+        document = message.get("document")
+        if document:
+            result = validate_json_file(document)
+            send_message(chat_id, result)
+            return jsonify({"ok": True})
+
+        text = (message.get("text") or "").strip()
+
+        if text in ("/start", "/help", "Help 🆘"):
+            reply = (
+                "Welcome to SILENT GMR JWT BOT!\n\n"
+                "Process File 📤 - Validate a JSON file\n"
+                "Vip Status 🛏 - Demo status\n"
+                "Vip Shop 🛒 - Demo shop\n"
+                "GitHub Status 📊 - Demo status\n"
+                "Scheduled Files ⚙️ - Demo status\n"
+                "API 1–5 🔌 - Not configured\n"
+                "Cancel ❌ - Cancel current operation"
+            )
+        elif text == "Process File 📤":
+            reply = (
+                "Ab apni .json file bhejo.\n"
+                'Format: [{"uid":"user1","password":"pass1"}]\n'
+                "File sirf validation ke liye check hogi."
+            )
+        elif text == "Cancel ❌":
+            reply = "Cancelled. Koi file process nahi hui."
+        elif text in ("/status", "Vip Status 🛏"):
+            reply = "Bot service is running. ✅"
+        elif text == "Vip Shop 🛒":
+            reply = "VIP Shop demo mode mein hai."
+        elif text == "GitHub Status 📊":
+            reply = "GitHub integration configured nahi hai."
+        elif text == "Scheduled Files ⚙️":
+            reply = "Scheduled file processing configured nahi hai."
+        elif text.startswith("API "):
+            reply = "Ye API abhi configure nahi hai."
+        else:
+            reply = "Command samajh nahi aaya. Help 🆘 dabao."
+
+        send_message(chat_id, reply)
+    except (
+        requests.RequestException,
+        ValueError,
+        UnicodeDecodeError,
+        KeyError,
+    ):
+        app.logger.exception("Webhook processing failed")
+        send_message(chat_id, "File process nahi hui. Format check karo.")
+
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000"))
+        port=int(os.environ.get("PORT", "10000")),
     )
